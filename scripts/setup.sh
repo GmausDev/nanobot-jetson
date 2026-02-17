@@ -100,7 +100,11 @@ patch_ggml_cuda10() {
     local src_dir="$1"
     log "Applying CUDA 10.2 compatibility patches..."
 
-    # Patch 1: Use NEON fallback implementations on aarch64 with GCC < 8
+    # Patch 1: Split NEON guard so vld1q_*_x2/x4 fallbacks are enabled on GCC < 8
+    # The original code has a single #if !defined(__aarch64__) block covering:
+    #   a) Functions that exist in GCC 7.5 (vmaxvq_f32, vzip1_u8, etc.) — must NOT redefine
+    #   b) vld1q_*_x2/x4 wrappers missing in GCC < 8 — MUST provide fallbacks
+    # We split (a) and (b) into separate guards.
     # File location differs: whisper.cpp uses ggml/src/, llama.cpp uses ggml/src/ggml-cpu/
     local cpu_impl=""
     if [ -f "${src_dir}/ggml/src/ggml-cpu-impl.h" ]; then
@@ -111,8 +115,13 @@ patch_ggml_cuda10() {
         warn "ggml-cpu-impl.h not found in ${src_dir}, skipping patch 1"
     fi
     if [ -n "$cpu_impl" ]; then
-        sed -i 's/^#if !defined(__aarch64__)$/#if !defined(__aarch64__) || (defined(__GNUC__) \&\& !defined(__clang__) \&\& __GNUC__ < 8)/' \
-            "$cpu_impl"
+        # Insert #endif and new guard between vzip2_u8 block and vld1q_* block
+        sed -i '/^\/\/ vld1q_s16_x2$/i\
+#endif // !defined(__aarch64__)\
+\
+// vld1q_*_x2/x4 are missing on GCC < 8 even on aarch64\
+#if !defined(__aarch64__) || (defined(__GNUC__) \&\& !defined(__clang__) \&\& __GNUC__ < 8)\
+' "$cpu_impl"
     fi
 
     # Patch 2: Replace constexpr __device__ with const __device__ (CUDA 10.2 compat)
@@ -133,30 +142,37 @@ patch_ggml_cuda10() {
 # Pinned to v1.7.2: last release compatible with CUDA 10.2 (before C++17 became mandatory)
 WHISPER_VERSION="v1.7.2"
 setup_whisper() {
-    log "Building whisper.cpp ${WHISPER_VERSION} with CUDA support..."
-    cd "${HOME}"
-
-    if [ -d whisper.cpp ]; then
-        cd whisper.cpp
-        git fetch --tags
+    if [ -x "${HOME}/whisper.cpp/build/bin/main" ]; then
+        log "whisper.cpp already built, skipping (delete ~/whisper.cpp/build to rebuild)"
     else
-        git clone https://github.com/ggerganov/whisper.cpp.git
-        cd whisper.cpp
+        log "Building whisper.cpp ${WHISPER_VERSION} with CUDA support..."
+        cd "${HOME}"
+
+        if [ -d whisper.cpp ]; then
+            cd whisper.cpp
+            git fetch --tags
+        else
+            git clone https://github.com/ggerganov/whisper.cpp.git
+            cd whisper.cpp
+        fi
+        git checkout "${WHISPER_VERSION}"
+
+        patch_ggml_cuda10 "${HOME}/whisper.cpp"
+
+        # Build with CUDA for Jetson Nano (sm_53)
+        # CMAKE_CUDA_COMPILER_FORCED skips broken nvcc detection in CMake 3.25+ with CUDA 10.2
+        mkdir -p build && cd build
+        cmake .. \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+            -DCMAKE_CUDA_COMPILER_FORCED=TRUE \
+            -DCMAKE_CUDA_ARCHITECTURES=53 \
+            -DCMAKE_BUILD_TYPE=Release
+        cmake --build . --config Release -j$(nproc)
+
+        # Symlink binary (v1.7.2 binary is named "main", not "whisper-cli")
+        sudo ln -sf "${HOME}/whisper.cpp/build/bin/main" /usr/local/bin/whisper-cli
     fi
-    git checkout "${WHISPER_VERSION}"
-
-    patch_ggml_cuda10 "${HOME}/whisper.cpp"
-
-    # Build with CUDA for Jetson Nano (sm_53)
-    mkdir -p build && cd build
-    cmake .. \
-        -DGGML_CUDA=ON \
-        -DCMAKE_CUDA_ARCHITECTURES=53 \
-        -DCMAKE_BUILD_TYPE=Release
-    cmake --build . --config Release -j$(nproc)
-
-    # Symlink binary (v1.7.2 binary is named "main", not "whisper-cli")
-    sudo ln -sf "${HOME}/whisper.cpp/build/bin/main" /usr/local/bin/whisper-cli
 
     # Download models
     mkdir -p "${MODELS_DIR}/whisper"
@@ -177,29 +193,35 @@ setup_whisper() {
 # Pinned to b4262: last release compatible with CUDA 10.2 (before C++17 became mandatory)
 LLAMA_VERSION="b4262"
 setup_llama() {
-    log "Building llama.cpp ${LLAMA_VERSION} with CUDA support..."
-    cd "${HOME}"
-
-    if [ -d llama.cpp ]; then
-        cd llama.cpp
-        git fetch --tags
+    if [ -x "${HOME}/llama.cpp/build/bin/llama-server" ]; then
+        log "llama.cpp already built, skipping (delete ~/llama.cpp/build to rebuild)"
     else
-        git clone https://github.com/ggerganov/llama.cpp.git
-        cd llama.cpp
+        log "Building llama.cpp ${LLAMA_VERSION} with CUDA support..."
+        cd "${HOME}"
+
+        if [ -d llama.cpp ]; then
+            cd llama.cpp
+            git fetch --tags
+        else
+            git clone https://github.com/ggerganov/llama.cpp.git
+            cd llama.cpp
+        fi
+        git checkout "${LLAMA_VERSION}"
+
+        patch_ggml_cuda10 "${HOME}/llama.cpp"
+
+        mkdir -p build && cd build
+        cmake .. \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+            -DCMAKE_CUDA_COMPILER_FORCED=TRUE \
+            -DCMAKE_CUDA_ARCHITECTURES=53 \
+            -DCMAKE_BUILD_TYPE=Release
+        cmake --build . --config Release -j$(nproc)
+
+        sudo ln -sf "${HOME}/llama.cpp/build/bin/llama-server" /usr/local/bin/llama-server
+        sudo ln -sf "${HOME}/llama.cpp/build/bin/llama-cli" /usr/local/bin/llama-cli
     fi
-    git checkout "${LLAMA_VERSION}"
-
-    patch_ggml_cuda10 "${HOME}/llama.cpp"
-
-    mkdir -p build && cd build
-    cmake .. \
-        -DGGML_CUDA=ON \
-        -DCMAKE_CUDA_ARCHITECTURES=53 \
-        -DCMAKE_BUILD_TYPE=Release
-    cmake --build . --config Release -j$(nproc)
-
-    sudo ln -sf "${HOME}/llama.cpp/build/bin/llama-server" /usr/local/bin/llama-server
-    sudo ln -sf "${HOME}/llama.cpp/build/bin/llama-cli" /usr/local/bin/llama-cli
 
     # Download TinyLlama model
     mkdir -p "${MODELS_DIR}/llm"
