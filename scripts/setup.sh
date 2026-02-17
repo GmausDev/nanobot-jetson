@@ -31,13 +31,29 @@ setup_system() {
     log "Updating system packages..."
     sudo apt-get update
     sudo apt-get install -y \
-        python3-pip python3-dev python3-venv \
         build-essential cmake git \
         portaudio19-dev libsndfile1-dev \
         libasound2-dev alsa-utils \
         libopenblas-dev liblapack-dev \
         libatlas-base-dev gfortran \
-        curl wget unzip
+        curl wget unzip \
+        software-properties-common
+
+    # Install Python 3.8 (Ubuntu 18.04 ships 3.6 which is EOL)
+    if ! command -v python3.8 &>/dev/null; then
+        log "Installing Python 3.8 via deadsnakes PPA..."
+        sudo add-apt-repository -y ppa:deadsnakes/ppa
+        sudo apt-get update
+    fi
+    sudo apt-get install -y \
+        python3.8 python3.8-venv python3.8-dev python3.8-distutils
+
+    # Install pip for 3.8
+    if ! python3.8 -m pip --version &>/dev/null; then
+        curl -sS https://bootstrap.pypa.io/get-pip.py | sudo python3.8
+    fi
+
+    log "Python 3.8 installed (system python3 left unchanged to avoid breaking apt)"
 
     # Create swap file (critical for 4GB Nano)
     if [ ! -f /swapfile ]; then
@@ -70,10 +86,16 @@ setup_system() {
 
 # --- Python environment ---
 setup_python() {
-    log "Setting up Python virtual environment..."
+    log "Setting up Python 3.8 virtual environment..."
     cd "${NANOBOT_DIR}"
 
-    python3 -m venv venv --system-site-packages
+    # Remove old 3.6 venv if present
+    if [ -d venv ] && venv/bin/python --version 2>&1 | grep -q "3\.6"; then
+        warn "Removing old Python 3.6 venv..."
+        rm -rf venv
+    fi
+
+    python3.8 -m venv venv --system-site-packages
     source venv/bin/activate
 
     pip install --upgrade pip
@@ -88,7 +110,7 @@ setup_python() {
     # PyAudio (needs portaudio headers)
     pip install pyaudio
 
-    log "Python environment ready ✓"
+    log "Python environment ready ($(python --version)) ✓"
 }
 
 # --- Patch ggml for CUDA 10.2 / GCC 7.5 compatibility ---
