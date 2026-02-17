@@ -15,6 +15,7 @@ from llm.streamer import SentenceStreamer
 from llm.prompt import PromptManager
 from tts.piper_engine import PiperTTS
 from eyes.eye_manager import EyeManager
+from audio.wake_word import WakeWordDetector
 
 logger = logging.getLogger("nanobot.orchestrator")
 
@@ -38,6 +39,7 @@ class Orchestrator:
         self.eyes: Optional[EyeManager] = None
         self.prompt_mgr: Optional[PromptManager] = None
         self.streamer: Optional[SentenceStreamer] = None
+        self.wake_detector: Optional[WakeWordDetector] = None
 
     async def setup(self):
         """Initialize all components."""
@@ -66,6 +68,15 @@ class Orchestrator:
         if cfg["eyes"]["enabled"]:
             self.eyes = EyeManager(cfg["eyes"])
             self.eyes.setup()
+
+        # Wake word detector (uses its own AudioCapture + VAD)
+        if cfg["wake_word"].get("enabled", True):
+            self.wake_detector = WakeWordDetector(
+                wake_config=cfg["wake_word"],
+                audio_config=cfg["audio"],
+                vad_config=cfg["vad"],
+                stt=self.stt,
+            )
 
         # Create tmp dir
         Path(cfg["system"]["tmp_dir"]).mkdir(parents=True, exist_ok=True)
@@ -144,30 +155,48 @@ class Orchestrator:
     # --- Wake Word Loop ---
     async def _wake_word_loop(self):
         """Continuously listen for wake word when IDLE."""
-        # For now, we use a simple approach: continuous VAD-based detection
-        # TODO: Replace with OpenWakeWord when hardware arrives
-        logger.info("Wake word listener started (press Enter as wake word for testing)")
+        if self.wake_detector is None:
+            logger.warning("Wake word detector not initialized, waiting for Enter key")
+            await self._fallback_wake_loop()
+            return
+
+        logger.info("Wake word listener started (whisper-based)")
 
         while self.running:
             if self.state != State.IDLE:
                 await asyncio.sleep(0.1)
                 continue
 
-            # For development: use stdin as wake trigger
-            # In production: replace with OpenWakeWord or GPIO button
+            if not self.wake_detector.check_cooldown():
+                await asyncio.sleep(0.1)
+                continue
+
             try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, self._wait_for_wake
+                detected, confidence, transcript = await asyncio.get_event_loop().run_in_executor(
+                    None, self.wake_detector.listen_once
                 )
+                if detected and self.state == State.IDLE:
+                    self.wake_detector.mark_detected()
+                    from core.events import wake_word_detected
+                    await self.event_queue.put(wake_word_detected(confidence))
+            except Exception as e:
+                logger.error(f"Wake word detection error: {e}", exc_info=True)
+                await asyncio.sleep(1.0)
+
+    async def _fallback_wake_loop(self):
+        """Fallback: use Enter key as wake trigger (for development)."""
+        logger.info("Fallback wake word: press Enter to trigger")
+        while self.running:
+            if self.state != State.IDLE:
+                await asyncio.sleep(0.1)
+                continue
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, input)
                 if self.state == State.IDLE:
                     from core.events import wake_word_detected
                     await self.event_queue.put(wake_word_detected(1.0))
             except Exception:
                 await asyncio.sleep(0.1)
-
-    def _wait_for_wake(self):
-        """Block until wake word detected. For dev: waits for Enter key."""
-        input()  # Press Enter to simulate wake word
 
     # --- State Handlers ---
 
@@ -284,6 +313,8 @@ class Orchestrator:
             self.capture.close()
         if self.playback:
             self.playback.close()
+        if self.wake_detector:
+            self.wake_detector.close()
         if self.eyes:
             self.eyes.shutdown()
         logger.info("Goodbye! 🤖")

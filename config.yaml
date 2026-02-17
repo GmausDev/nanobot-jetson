@@ -21,11 +21,15 @@ vad:
 # --- Wake Word ---
 wake_word:
   enabled: true
-  engine: "openwakeword"   # "openwakeword" or "button" (GPIO button)
-  model: "hey_jarvis"      # openwakeword model name
-  threshold: 0.5           # detection confidence threshold
-  cooldown: 2.0            # seconds to wait after wake word before listening again
-  gpio_pin: null           # GPIO pin for physical button (if engine=button)
+  engine: "whisper"         # "whisper" (VAD + transcribe) or "button" (GPIO button)
+  phrases:                  # trigger phrases (checked case-insensitive)
+    - "hey jarvis"
+    - "hey travis"          # common whisper mishearing
+    - "a jarvis"
+  threshold: 0.5            # detection confidence threshold
+  cooldown: 2.0             # seconds to wait after wake word before listening again
+  listen_duration: 3.0      # seconds to record per VAD burst for wake detection
+  gpio_pin: null            # GPIO pin for physical button (if engine=button)
 
 # --- Speech-to-Text ---
 stt:

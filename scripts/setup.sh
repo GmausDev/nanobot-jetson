@@ -278,24 +278,6 @@ setup_piper() {
     log "Piper TTS installed with EN + ES voices ✓"
 }
 
-# --- Install OpenWakeWord ---
-setup_wakeword() {
-    log "Installing OpenWakeWord..."
-    cd "${NANOBOT_DIR}"
-    source venv/bin/activate
-
-    pip install openwakeword
-
-    # Pre-download wake word models
-    python3 -c "
-import openwakeword
-openwakeword.utils.download_models()
-print('OpenWakeWord models downloaded')
-"
-
-    log "OpenWakeWord ready ✓"
-}
-
 # --- Install LED library ---
 setup_leds() {
     log "Installing rpi_ws281x for Jetson..."
@@ -378,7 +360,6 @@ main() {
             setup_whisper
             setup_llama
             setup_piper
-            setup_wakeword
             setup_leds
             setup_service
             ;;
@@ -387,11 +368,10 @@ main() {
         whisper)  setup_whisper ;;
         llama)    setup_llama ;;
         piper)    setup_piper ;;
-        wakeword) setup_wakeword ;;
         leds)     setup_leds ;;
         service)  setup_service ;;
         *)
-            echo "Usage: sudo bash setup.sh [all|system|python|whisper|llama|piper|wakeword|leds|service]"
+            echo "Usage: sudo bash setup.sh [all|system|python|whisper|llama|piper|leds|service]"
             exit 1
             ;;
     esac
