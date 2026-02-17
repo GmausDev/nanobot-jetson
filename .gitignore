@@ -1,0 +1,30 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Models (download via setup.sh)
+*.gguf
+*.bin
+*.onnx
+*.onnx.json
+
+# Runtime
+/tmp/nanobot/
+
+# Environment
+.env
+.env.*
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
