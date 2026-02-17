@@ -101,8 +101,19 @@ patch_ggml_cuda10() {
     log "Applying CUDA 10.2 compatibility patches..."
 
     # Patch 1: Use NEON fallback implementations on aarch64 with GCC < 8
-    sed -i 's/^#if !defined(__aarch64__)$/#if !defined(__aarch64__) || (defined(__GNUC__) \&\& !defined(__clang__) \&\& __GNUC__ < 8)/' \
-        "${src_dir}/ggml/src/ggml-cpu-impl.h"
+    # File location differs: whisper.cpp uses ggml/src/, llama.cpp uses ggml/src/ggml-cpu/
+    local cpu_impl=""
+    if [ -f "${src_dir}/ggml/src/ggml-cpu-impl.h" ]; then
+        cpu_impl="${src_dir}/ggml/src/ggml-cpu-impl.h"
+    elif [ -f "${src_dir}/ggml/src/ggml-cpu/ggml-cpu-impl.h" ]; then
+        cpu_impl="${src_dir}/ggml/src/ggml-cpu/ggml-cpu-impl.h"
+    else
+        warn "ggml-cpu-impl.h not found in ${src_dir}, skipping patch 1"
+    fi
+    if [ -n "$cpu_impl" ]; then
+        sed -i 's/^#if !defined(__aarch64__)$/#if !defined(__aarch64__) || (defined(__GNUC__) \&\& !defined(__clang__) \&\& __GNUC__ < 8)/' \
+            "$cpu_impl"
+    fi
 
     # Patch 2: Replace constexpr __device__ with const __device__ (CUDA 10.2 compat)
     sed -i 's/static constexpr __device__/static __device__ const/g' \
