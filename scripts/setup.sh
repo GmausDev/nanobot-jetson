@@ -7,6 +7,8 @@ set -euo pipefail
 
 NANOBOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MODELS_DIR="${NANOBOT_DIR}/models"
+# Resolve the real owner's home dir (not /root when run via sudo)
+OWNER_HOME="$(eval echo ~"$(stat -c '%U' "${NANOBOT_DIR}")")"
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
@@ -160,15 +162,42 @@ patch_ggml_cuda10() {
     log "CUDA 10.2 patches applied ✓"
 }
 
+# --- Install GCC 8 + CMake >= 3.14 (needed for C++17 builds) ---
+setup_build_tools() {
+    # GCC 8 (C++17 support — GCC 7.5 shipped with Ubuntu 18.04 is not sufficient)
+    if ! command -v gcc-8 &>/dev/null; then
+        log "Installing GCC 8 from ubuntu-toolchain-r PPA..."
+        sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+        sudo apt-get update
+        sudo apt-get install -y gcc-8 g++-8
+    fi
+    log "GCC 8: $(gcc-8 --version | head -1) ✓"
+
+    # CMake >= 3.14 (Ubuntu 18.04 ships 3.10, piper needs >= 3.13)
+    local cmake_ver
+    cmake_ver=$(cmake --version 2>/dev/null | head -1 | grep -oP '[\d.]+$' || echo "0.0.0")
+    if dpkg --compare-versions "$cmake_ver" lt "3.14"; then
+        log "Installing CMake >= 3.14 from Kitware APT repo..."
+        wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
+        echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ bionic main' \
+            | sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
+        sudo apt-get update
+        sudo apt-get install -y cmake
+    fi
+    log "CMake: $(cmake --version | head -1) ✓"
+}
+
 # --- Build whisper.cpp with CUDA ---
 # Pinned to v1.7.2: last release compatible with CUDA 10.2 (before C++17 became mandatory)
 WHISPER_VERSION="v1.7.2"
 setup_whisper() {
-    if [ -x "${HOME}/whisper.cpp/build/bin/main" ]; then
+    if [ -x "${OWNER_HOME}/whisper.cpp/build/bin/main" ]; then
         log "whisper.cpp already built, skipping (delete ~/whisper.cpp/build to rebuild)"
     else
         log "Building whisper.cpp ${WHISPER_VERSION} with CUDA support..."
-        cd "${HOME}"
+        cd "${OWNER_HOME}"
 
         if [ -d whisper.cpp ]; then
             cd whisper.cpp
@@ -179,7 +208,7 @@ setup_whisper() {
         fi
         git checkout "${WHISPER_VERSION}"
 
-        patch_ggml_cuda10 "${HOME}/whisper.cpp"
+        patch_ggml_cuda10 "${OWNER_HOME}/whisper.cpp"
 
         # Build with CUDA for Jetson Nano (sm_53)
         # CMAKE_CUDA_COMPILER_FORCED skips broken nvcc detection in CMake 3.25+ with CUDA 10.2
@@ -193,12 +222,12 @@ setup_whisper() {
         cmake --build . --config Release -j$(nproc)
 
         # Symlink binary (v1.7.2 binary is named "main", not "whisper-cli")
-        sudo ln -sf "${HOME}/whisper.cpp/build/bin/main" /usr/local/bin/whisper-cli
+        sudo ln -sf "${OWNER_HOME}/whisper.cpp/build/bin/main" /usr/local/bin/whisper-cli
     fi
 
     # Download models
     mkdir -p "${MODELS_DIR}/whisper"
-    cd "${HOME}/whisper.cpp"
+    cd "${OWNER_HOME}/whisper.cpp"
 
     log "Downloading Whisper tiny.en model (English)..."
     bash models/download-ggml-model.sh tiny.en
@@ -215,11 +244,11 @@ setup_whisper() {
 # Pinned to b4262: last release compatible with CUDA 10.2 (before C++17 became mandatory)
 LLAMA_VERSION="b4262"
 setup_llama() {
-    if [ -x "${HOME}/llama.cpp/build/bin/llama-server" ]; then
+    if [ -x "${OWNER_HOME}/llama.cpp/build/bin/llama-server" ]; then
         log "llama.cpp already built, skipping (delete ~/llama.cpp/build to rebuild)"
     else
         log "Building llama.cpp ${LLAMA_VERSION} with CUDA support..."
-        cd "${HOME}"
+        cd "${OWNER_HOME}"
 
         if [ -d llama.cpp ]; then
             cd llama.cpp
@@ -230,7 +259,7 @@ setup_llama() {
         fi
         git checkout "${LLAMA_VERSION}"
 
-        patch_ggml_cuda10 "${HOME}/llama.cpp"
+        patch_ggml_cuda10 "${OWNER_HOME}/llama.cpp"
 
         mkdir -p build && cd build
         cmake .. \
@@ -241,8 +270,8 @@ setup_llama() {
             -DCMAKE_BUILD_TYPE=Release
         cmake --build . --config Release -j$(nproc)
 
-        sudo ln -sf "${HOME}/llama.cpp/build/bin/llama-server" /usr/local/bin/llama-server
-        sudo ln -sf "${HOME}/llama.cpp/build/bin/llama-cli" /usr/local/bin/llama-cli
+        sudo ln -sf "${OWNER_HOME}/llama.cpp/build/bin/llama-server" /usr/local/bin/llama-server
+        sudo ln -sf "${OWNER_HOME}/llama.cpp/build/bin/llama-cli" /usr/local/bin/llama-cli
     fi
 
     # Download TinyLlama model
@@ -258,22 +287,122 @@ setup_llama() {
     log "llama.cpp ${LLAMA_VERSION} built and TinyLlama downloaded ✓"
 }
 
-# --- Install Piper TTS ---
+# --- Build Piper TTS from source ---
+# Pre-built binaries require GLIBC >= 2.29 but Jetson Nano (Ubuntu 18.04) has 2.27.
+# Builds each component separately to avoid CMake 3.20+ ExternalProject dependency
+# scanner issues. Order: onnxruntime (download) → piper-phonemize → piper.
+# Uses CPU-only onnxruntime (CUDA 10.2 is too old for onnxruntime GPU support).
 setup_piper() {
-    log "Installing Piper TTS..."
-    cd "${HOME}"
+    local piper_src="${OWNER_HOME}/piper-src"
+    local piper_install="${OWNER_HOME}/piper"
+    local phonemize_src="${OWNER_HOME}/piper-phonemize-src"
+    local phonemize_install="${OWNER_HOME}/piper-phonemize-install"
 
-    # Download pre-built Piper for aarch64
-    PIPER_VERSION="2023.11.14-2"
-    PIPER_URL="https://github.com/rhasspy/piper/releases/download/${PIPER_VERSION}/piper_linux_aarch64.tar.gz"
+    export CC=gcc-8
+    export CXX=g++-8
 
-    if [ ! -f piper/piper ]; then
-        wget -q --show-progress -O piper.tar.gz "${PIPER_URL}"
-        tar xzf piper.tar.gz
-        rm piper.tar.gz
+    if [ -x "${piper_install}/piper" ]; then
+        log "Piper already built, skipping (delete ~/piper to rebuild)"
+    else
+        log "Building Piper TTS from source (this takes a while on Nano)..."
+
+        # ---- Step 1: Download onnxruntime and verify GLIBC compat ----
+        local onnx_version="1.14.1"
+        local onnx_prefix="onnxruntime-linux-aarch64-${onnx_version}"
+        local onnx_dir="${OWNER_HOME}/onnxruntime-aarch64"
+
+        if [ ! -d "${onnx_dir}" ]; then
+            log "Downloading onnxruntime ${onnx_version} for aarch64..."
+            cd "${OWNER_HOME}"
+            wget -q --show-progress \
+                "https://github.com/microsoft/onnxruntime/releases/download/v${onnx_version}/${onnx_prefix}.tgz" \
+                -O "${onnx_prefix}.tgz"
+            tar xzf "${onnx_prefix}.tgz"
+            mv "${onnx_prefix}" onnxruntime-aarch64
+            rm "${onnx_prefix}.tgz"
+        fi
+
+        # Check GLIBC requirements (|| true to survive set -euo pipefail)
+        local system_glibc max_glibc
+        system_glibc=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | tail -1) || true
+        max_glibc=$(objdump -T "${onnx_dir}/lib/libonnxruntime.so" 2>/dev/null \
+            | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -V | tail -1) || true
+
+        if [ -n "$max_glibc" ] && \
+           [ "$(printf '%s\n' "$max_glibc" "$system_glibc" | sort -V | tail -1)" != "$system_glibc" ]; then
+            warn "Official onnxruntime ${onnx_version} needs GLIBC ${max_glibc} (system has ${system_glibc})"
+            log "Downloading csukuangfj onnxruntime build (targets glibc 2.17)..."
+
+            rm -rf "${onnx_dir}"
+
+            local compat_ver="1.17.1"
+            local compat_name="onnxruntime-linux-aarch64-glibc2_17-Release-${compat_ver}"
+            cd "${OWNER_HOME}"
+            wget -q --show-progress \
+                "https://github.com/csukuangfj/onnxruntime-libs/releases/download/v${compat_ver}/${compat_name}.zip" \
+                -O onnxruntime-compat.zip
+            unzip -qo onnxruntime-compat.zip
+            mv "${compat_name}" onnxruntime-aarch64
+            rm onnxruntime-compat.zip
+            log "Using csukuangfj onnxruntime ${compat_ver} (glibc 2.17) ✓"
+        else
+            log "Official onnxruntime ${onnx_version} GLIBC compatible ✓"
+        fi
+
+        # ---- Step 2: Build piper-phonemize (+ espeak-ng) ----
+        if [ ! -f "${phonemize_install}/lib/libpiper_phonemize.so" ]; then
+            log "Building piper-phonemize..."
+            cd "${OWNER_HOME}"
+
+            if [ -d "${phonemize_src}" ]; then
+                cd "${phonemize_src}" && git pull --ff-only || true
+            else
+                git clone https://github.com/rhasspy/piper-phonemize.git "${phonemize_src}"
+                cd "${phonemize_src}"
+            fi
+
+            rm -rf build && mkdir build && cd build
+            # GCC 8 needs -lstdc++fs for std::filesystem (merged into libstdc++ in GCC 9+)
+            cmake .. \
+                -DCMAKE_INSTALL_PREFIX="${phonemize_install}" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DONNXRUNTIME_DIR="${onnx_dir}" \
+                -DCMAKE_EXE_LINKER_FLAGS="-lstdc++fs" \
+                -DCMAKE_SHARED_LINKER_FLAGS="-lstdc++fs"
+            cmake --build . --config Release -j2
+            cmake --install .
+            log "piper-phonemize built ✓"
+        else
+            log "piper-phonemize already built, skipping"
+        fi
+
+        # ---- Step 3: Build piper ----
+        log "Building piper..."
+        cd "${OWNER_HOME}"
+
+        if [ -d "${piper_src}" ]; then
+            cd "${piper_src}"
+            git pull --ff-only || true
+        else
+            git clone https://github.com/rhasspy/piper.git "${piper_src}"
+            cd "${piper_src}"
+        fi
+
+        # PIPER_PHONEMIZE_DIR skips piper's ExternalProject for piper-phonemize
+        rm -rf build && mkdir build && cd build
+        cmake .. \
+            -DCMAKE_INSTALL_PREFIX="${piper_install}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPIPER_PHONEMIZE_DIR="${phonemize_install}"
+        cmake --build . --config Release -j2
+        cmake --install .
+
+        log "Piper built and installed to ${piper_install} ✓"
     fi
 
-    sudo ln -sf "${HOME}/piper/piper" /usr/local/bin/piper
+    unset CC CXX
+
+    sudo ln -sf "${piper_install}/piper" /usr/local/bin/piper
 
     # Download voice models
     mkdir -p "${MODELS_DIR}/piper"
@@ -297,7 +426,7 @@ setup_piper() {
             "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json"
     fi
 
-    log "Piper TTS installed with EN + ES voices ✓"
+    log "Piper TTS built from source with EN + ES voices ✓"
 }
 
 # --- Install LED library ---
@@ -325,7 +454,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${NANOBOT_DIR}
-ExecStartPre=${HOME}/llama.cpp/build/bin/llama-server -m ${MODELS_DIR}/llm/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --port 8080 -ngl 24 -c 1024 &
+ExecStartPre=${OWNER_HOME}/llama.cpp/build/bin/llama-server -m ${MODELS_DIR}/llm/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --port 8080 -ngl 24 -c 1024 &
 ExecStart=${NANOBOT_DIR}/venv/bin/python ${NANOBOT_DIR}/main.py
 Restart=on-failure
 RestartSec=5
@@ -343,7 +472,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=${HOME}/llama.cpp/build/bin/llama-server \
+ExecStart=${OWNER_HOME}/llama.cpp/build/bin/llama-server \
     -m ${MODELS_DIR}/llm/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
     --host 127.0.0.1 --port 8080 \
     -ngl 24 -c 1024 --threads 4
@@ -378,6 +507,7 @@ main() {
     case "${1:-all}" in
         all)
             setup_system
+            setup_build_tools
             setup_python
             setup_whisper
             setup_llama
@@ -385,15 +515,16 @@ main() {
             setup_leds
             setup_service
             ;;
-        system)   setup_system ;;
-        python)   setup_python ;;
-        whisper)  setup_whisper ;;
-        llama)    setup_llama ;;
-        piper)    setup_piper ;;
-        leds)     setup_leds ;;
-        service)  setup_service ;;
+        system)      setup_system ;;
+        build_tools) setup_build_tools ;;
+        python)      setup_python ;;
+        whisper)     setup_whisper ;;
+        llama)       setup_llama ;;
+        piper)       setup_piper ;;
+        leds)        setup_leds ;;
+        service)     setup_service ;;
         *)
-            echo "Usage: sudo bash setup.sh [all|system|python|whisper|llama|piper|leds|service]"
+            echo "Usage: sudo bash setup.sh [all|system|python|build_tools|whisper|llama|piper|leds|service]"
             exit 1
             ;;
     esac
