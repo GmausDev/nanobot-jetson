@@ -361,14 +361,18 @@ setup_piper() {
                 cd "${phonemize_src}"
             fi
 
-            rm -rf build && mkdir build && cd build
             # GCC 8 needs -lstdc++fs for std::filesystem (merged into libstdc++ in GCC 9+)
+            # Patch CMakeLists.txt: insert link_libraries after closing ) of project()
+            if ! grep -q "stdc++fs" CMakeLists.txt; then
+                sed -i '/^    LANGUAGES CXX/,/^)/{/^)/a\link_libraries(stdc++fs)
+                }' CMakeLists.txt
+            fi
+
+            rm -rf build && mkdir build && cd build
             cmake .. \
                 -DCMAKE_INSTALL_PREFIX="${phonemize_install}" \
                 -DCMAKE_BUILD_TYPE=Release \
-                -DONNXRUNTIME_DIR="${onnx_dir}" \
-                -DCMAKE_EXE_LINKER_FLAGS="-lstdc++fs" \
-                -DCMAKE_SHARED_LINKER_FLAGS="-lstdc++fs"
+                -DONNXRUNTIME_DIR="${onnx_dir}"
             cmake --build . --config Release -j2
             cmake --install .
             log "piper-phonemize built ✓"
