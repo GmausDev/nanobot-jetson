@@ -50,6 +50,11 @@ class AudioCapture:
         if not HAS_PYAUDIO:
             raise RuntimeError("PyAudio not installed")
 
+        # Reinitialize PyAudio if it was terminated
+        if self.pa is None:
+            self.pa = pyaudio.PyAudio()
+            self._find_device()
+
         self.stream = self.pa.open(
             format=pyaudio.paInt16,
             channels=self.channels,
@@ -73,12 +78,19 @@ class AudioCapture:
         while True:
             yield self.read_chunk()
 
+    def close_stream(self):
+        """Close just the audio stream (keeps PyAudio alive for reuse)."""
+        if self.stream:
+            try:
+                self.stream.stop_stream()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+
     def close(self):
         """Close stream and terminate PyAudio."""
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-            self.stream = None
+        self.close_stream()
         if self.pa:
             self.pa.terminate()
             self.pa = None

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import time
 from pathlib import Path
@@ -78,7 +80,7 @@ class WakeWordDetector:
                     return (False, 0.0, "")
 
         finally:
-            self.capture.close()
+            self.capture.close_stream()
 
         # Need at least ~0.3s of audio to be worth transcribing
         total_duration = len(frames) * chunk_duration
