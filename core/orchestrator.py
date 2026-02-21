@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import yaml
@@ -26,7 +28,7 @@ class Orchestrator:
             self.config = yaml.safe_load(f)
 
         self.state = State.IDLE
-        self.event_queue: asyncio.Queue[Event] = asyncio.Queue()
+        self.event_queue: asyncio.Queue[Event] | None = None  # Created in setup()
         self.running = False
 
         # Components (initialized in setup())
@@ -44,6 +46,10 @@ class Orchestrator:
     async def setup(self):
         """Initialize all components."""
         logger.info("Initializing NanoBot components...")
+
+        # Create event queue in the running event loop (Python 3.8 compat)
+        self.event_queue = asyncio.Queue()
+
         cfg = self.config
 
         # Audio
